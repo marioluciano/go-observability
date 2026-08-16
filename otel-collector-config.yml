@@ -1,0 +1,28 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+  attributes:
+    actions:
+      - key: peer.service
+        from_attribute: net.peer.name
+        action: upsert
+      - key: http.host
+        from_attribute: net.peer.name
+        action: upsert
+
+exporters:
+  zipkin:
+    endpoint: http://zipkin:9411/api/v2/spans
+    format: json
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes]
+      exporters: [zipkin]
