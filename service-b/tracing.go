@@ -11,7 +11,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 func initTracing(serviceName string) (func(context.Context) error, error) {
