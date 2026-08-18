@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"syscall"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -18,7 +20,9 @@ import (
 )
 
 type WeatherRequest struct {
-	CEP string `json:"cep"`
+	// Raw so that a non-string cep can be rejected as an invalid zipcode
+	// rather than as a malformed body. See extractCEP.
+	CEP json.RawMessage `json:"cep"`
 }
 
 type WeatherResponse struct {
@@ -32,9 +36,21 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
+var ErrZipCodeNotFound = errors.New("zipcode not found")
+
 type ViaCEPResponse struct {
-	Localidade string `json:"localidade"`
-	Erro       bool   `json:"erro"`
+	Localidade string          `json:"localidade"`
+	Erro       json.RawMessage `json:"erro"`
+}
+
+func (r ViaCEPResponse) NotFound() bool {
+	if r.Localidade == "" {
+		return true
+	}
+
+	raw := strings.Trim(strings.TrimSpace(string(r.Erro)), `"`)
+
+	return raw != "" && raw != "false"
 }
 
 type WeatherAPIResponse struct {
@@ -94,25 +110,24 @@ func handleWeatherRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Any input problem is an invalid zipcode: the contract defines only 422
+	// and 404 as failures, so an unreadable body must not produce a 400.
 	var req WeatherRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{Message: "invalid request format"})
+		writeInvalidZipCode(w)
 		return
 	}
 
-	if !isValidCEP(req.CEP) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		json.NewEncoder(w).Encode(ErrorResponse{Message: "invalid zipcode"})
+	cep, ok := extractCEP(req.CEP)
+	if !ok || !isValidCEP(cep) {
+		writeInvalidZipCode(w)
 		return
 	}
 
-	city, err := getCityByCEP(ctx, req.CEP)
+	city, err := getCityByCEP(ctx, cep)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		if err.Error() == "zipcode not found" {
+		if errors.Is(err, ErrZipCodeNotFound) {
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(ErrorResponse{Message: "can not find zipcode"})
 		} else {
@@ -145,6 +160,35 @@ func handleWeatherRequest(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// extractCEP pulls the cep out of the request payload.
+//
+// The field is decoded as raw JSON rather than straight into a string because
+// the specification treats a non-string cep as an invalid zipcode (422), not
+// as a malformed request. Decoding into a string directly would fail before
+// that distinction could be made, turning {"cep": 29902555} into a 400.
+func extractCEP(raw json.RawMessage) (string, bool) {
+	// The cep must be a JSON string. A number, boolean, null, object, array
+	// or a missing field is an invalid zipcode (422), not a malformed request.
+	// Unmarshalling straight into a string would not do: it fails on a number
+	// (which would become a 400) and silently accepts null (which would pass
+	// as an empty string).
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+
+	cep, ok := value.(string)
+
+	return cep, ok
+}
+
+// writeInvalidZipCode emits the 422 response defined by the specification.
+func writeInvalidZipCode(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	json.NewEncoder(w).Encode(ErrorResponse{Message: "invalid zipcode"})
+}
+
 func isValidCEP(cep string) bool {
 	matched, _ := regexp.MatchString(`^\d{8}$`, cep)
 	return matched
@@ -168,17 +212,21 @@ func getCityByCEP(ctx context.Context, cep string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
+		return "", ErrZipCodeNotFound
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ViaCEP returned status %d", resp.StatusCode)
+	}
+
 	var viaCEPResp ViaCEPResponse
 	if err := json.NewDecoder(resp.Body).Decode(&viaCEPResp); err != nil {
 		return "", fmt.Errorf("failed to parse ViaCEP response: %w", err)
 	}
 
-	if viaCEPResp.Erro {
-		return "", fmt.Errorf("zipcode not found")
-	}
-
-	if viaCEPResp.Localidade == "" {
-		return "", fmt.Errorf("zipcode not found")
+	if viaCEPResp.NotFound() {
+		return "", ErrZipCodeNotFound
 	}
 
 	return viaCEPResp.Localidade, nil
